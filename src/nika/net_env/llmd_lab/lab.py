@@ -38,9 +38,13 @@ _KUBECONFIG_REMOTE_PATH = "/etc/rancher/k3s/k3s.yaml"
 
 _K3S_ULIMITS = ["nproc=65535", "nofile=65535"]
 _HELM_VERSION = "v3.21.3"
+# (os, arch) -> sha256 of the official get.helm.sh archive. Linux helm is staged into the k3s node; the host
+# runs `helm pull` with a build for its own OS (macOS cannot exec the Linux binary: Errno 8).
 _HELM_ARCHIVE_SHA256 = {
-    "amd64": "15e041a93a590dce8100f39385cd98c84a765c9e36aeeb9e2dc6ff9e4769e2e0",
-    "arm64": "67f58155079ff9ffab98ba5c88daff0ed9b542f3a4732f5dd426dde7dd0f5244",
+    ("linux", "amd64"): "15e041a93a590dce8100f39385cd98c84a765c9e36aeeb9e2dc6ff9e4769e2e0",
+    ("linux", "arm64"): "67f58155079ff9ffab98ba5c88daff0ed9b542f3a4732f5dd426dde7dd0f5244",
+    ("darwin", "amd64"): "76d0db4730b05d3d625eee11e80f0721b32b4d8422f4e5d093de6337bf3ac9f8",
+    ("darwin", "arm64"): "19879a848cad832b7a1ac24b767a481d20fb3b95ab53a220849649422ada144e",
 }
 machine = platform.machine().lower()
 if machine in ("x86_64", "amd64"):
@@ -49,9 +53,7 @@ elif machine in ("aarch64", "arm64"):
     _HELM_ARCHITECTURE = "arm64"
 else:
     raise RuntimeError(f"Unsupported Helm host architecture: {machine}")
-_HELM_ARCHIVE_URL = (
-    f"https://get.helm.sh/helm-{_HELM_VERSION}-linux-{_HELM_ARCHITECTURE}.tar.gz"
-)
+_HOST_OS = "darwin" if platform.system() == "Darwin" else "linux"
 _AGENTGATEWAY_VERSION = "v1.1.0"
 _HELM_CHART_SHA256 = {
     "agentgateway-crds": "abc114babffc70061248d1526c0508357c39cfaada00640d1b60f4bc6cad3a1e",
@@ -63,33 +65,36 @@ _HELM_CHART_SPECS = (
 )
 
 
-def _ensure_helm_binary() -> Path:
-    """Download Helm on the host (k3s busybox wget has no HTTPS) and stage it for Kathara."""
+def _ensure_helm_binary(os_name: str = "linux") -> Path:
+    """Download Helm for `os_name` (k3s busybox wget has no HTTPS): linux for the node, the host OS for `helm pull`."""
     cache_dir = REPO_ROOT / ".nika_cache" / "helm" / _HELM_VERSION
-    helm_bin = cache_dir / f"helm-{_HELM_ARCHITECTURE}"
+    stem = f"helm-{_HELM_ARCHITECTURE}" if os_name == "linux" else f"helm-{os_name}-{_HELM_ARCHITECTURE}"
+    helm_bin = cache_dir / stem
     if helm_bin.is_file() and os.access(helm_bin, os.X_OK):
         return helm_bin
 
+    platform_dir = f"{os_name}-{_HELM_ARCHITECTURE}"
+    url = f"https://get.helm.sh/helm-{_HELM_VERSION}-{platform_dir}.tar.gz"
     cache_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         archive = Path(tmp) / "helm.tgz"
         with (
-            urllib.request.urlopen(_HELM_ARCHIVE_URL, timeout=60) as response,
+            urllib.request.urlopen(url, timeout=60) as response,
             archive.open("wb") as output,
         ):
             shutil.copyfileobj(response, output)
         with archive.open("rb") as handle:
             if (
                 hashlib.file_digest(handle, "sha256").hexdigest()
-                != _HELM_ARCHIVE_SHA256[_HELM_ARCHITECTURE]
+                != _HELM_ARCHIVE_SHA256[(os_name, _HELM_ARCHITECTURE)]
             ):
                 raise RuntimeError(
                     "Helm archive checksum does not match the pinned release"
                 )
         with tarfile.open(archive, "r:gz") as tar:
-            member = tar.getmember(f"linux-{_HELM_ARCHITECTURE}/helm")
+            member = tar.getmember(f"{platform_dir}/helm")
             tar.extract(member, path=tmp, filter="data")
-        extracted = Path(tmp) / f"linux-{_HELM_ARCHITECTURE}" / "helm"
+        extracted = Path(tmp) / platform_dir / "helm"
         shutil.copy2(extracted, helm_bin)
         helm_bin.chmod(0o755)
     return helm_bin
@@ -101,7 +106,7 @@ def ensure_helm_charts() -> list[Path]:
 
     cache_dir = REPO_ROOT / ".nika_cache" / "helm" / "charts"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    helm_bin = _ensure_helm_binary()
+    helm_bin = _ensure_helm_binary(_HOST_OS)  # runs on the host
     chart_paths: list[Path] = []
     for chart_name, oci_url in _HELM_CHART_SPECS:
         chart_path = cache_dir / f"{chart_name}-{_AGENTGATEWAY_VERSION}.tgz"
